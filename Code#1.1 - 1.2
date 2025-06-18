@@ -1,0 +1,228 @@
+-- Ниже - для доставки до РЦ
+WITH not_fully_delivered as (
+    SELECT so.id
+    FROM order_service.Supplier_Order so
+        LEFT JOIN order_service.cargo_unit cu ON so.id = cu.supplier_order_id
+        LEFT JOIN order_service.cargo_unit_shipment cus ON cu.id = cus.cargo_unit_id
+        LEFT JOIN order_service.shipment s ON cus.shipment_id = s.id
+    WHERE cu.cargo_unit_number IS NOT NULL
+    GROUP BY so.id
+    HAVING 
+        COUNT(DISTINCT CASE WHEN s.rc_delivered_ts IS NOT NULL THEN cu.cargo_unit_number END) > 0
+        AND COUNT(DISTINCT CASE WHEN s.rc_delivered_ts IS NOT NULL THEN cu.cargo_unit_number END) < COUNT(DISTINCT cu.cargo_unit_number)
+),
+
+fully_delivered as (
+    SELECT distinct so.id, max(s.rc_delivered_ts) rc_delivered_ts
+    FROM order_service.Supplier_Order so
+        LEFT JOIN order_service.cargo_unit cu ON so.id = cu.supplier_order_id
+        LEFT JOIN order_service.cargo_unit_shipment cus ON cu.id = cus.cargo_unit_id
+        LEFT JOIN order_service.shipment s ON cus.shipment_id = s.id
+        LEFT JOIN not_fully_delivered nfd ON so.id = nfd.id
+    WHERE nfd.id IS NULL
+    GROUP BY 1
+    HAVING max(s.rc_delivered_ts) IS NOT NULL
+),
+
+-- Ниже - для доставки до клиента
+nfd_client as (
+    SELECT so.id
+    FROM order_service.Supplier_Order so
+        LEFT JOIN order_service.cargo_unit cu ON so.id = cu.supplier_order_id
+        LEFT JOIN order_service.cargo_unit_shipment cus ON cu.id = cus.cargo_unit_id
+        LEFT JOIN order_service.shipment s ON cus.shipment_id = s.id
+    WHERE cu.cargo_unit_number IS NOT NULL
+    GROUP BY so.id
+    HAVING 
+        COUNT(DISTINCT CASE WHEN coalesce(cu.warehouse_delivered_date, cu.warehouse_delivered_ts) IS NOT NULL THEN cu.cargo_unit_number END) > 0
+        AND COUNT(DISTINCT CASE WHEN coalesce(cu.warehouse_delivered_date, cu.warehouse_delivered_ts) IS NOT NULL THEN cu.cargo_unit_number END) < COUNT(DISTINCT cu.cargo_unit_number)
+),
+
+fd_client as (
+    SELECT distinct so.id, max(coalesce(cu.warehouse_delivered_date, cu.warehouse_delivered_ts)) client_del_ts
+    FROM order_service.Supplier_Order so
+        LEFT JOIN order_service.cargo_unit cu ON so.id = cu.supplier_order_id
+        LEFT JOIN order_service.cargo_unit_shipment cus ON cu.id = cus.cargo_unit_id
+        LEFT JOIN order_service.shipment s ON cus.shipment_id = s.id
+        LEFT JOIN nfd_client ON so.id = nfd_client.id
+    WHERE nfd_client.id IS NULL
+    GROUP BY 1
+    HAVING max(coalesce(cu.warehouse_delivered_date, cu.warehouse_delivered_ts)) IS NOT NULL
+),
+----------------------------------------
+
+timegate as ( -- ДОПУСК Если поставщик опоздал, то подзаказ имеет дополнительную дельту на доставку с РЦ. только для непрямых
+    SELECT 
+        so.id,
+        CASE 
+            WHEN fd.rc_delivered_ts IS NOT NULL AND fd.rc_delivered_ts > so.date_delivery THEN fd.rc_delivered_ts - so.date_delivery
+            WHEN so.rc_accepted_ts IS NOT NULL AND so.rc_accepted_ts > so.date_delivery THEN so.rc_accepted_ts - so.date_delivery
+            WHEN so.rc_accepted_ts IS NULL AND NOW() > so.date_delivery THEN now() - so.date_delivery
+        END as timegate
+    FROM order_service.Supplier_Order so
+    LEFT JOIN not_fully_delivered nfd ON so.id = nfd.id
+    LEFT JOIN fully_delivered fd ON so.id = fd.id
+    WHERE
+        so.system_status not in ('DRAFT', 'DECLINED', 'CANCELED') 
+        and so.create_ts > '11.01.2023' 
+        and so.is_available_basis IN ('false')
+),
+
+full_delivery as ( -- Распределение опозданий поставок
+    SELECT 
+        so.id, 
+        DATE_TRUNC('month', so.client_delivery_date) AS month, 
+    CASE 
+    WHEN o.client_id::int = 2 THEN -- Для client_id = 2
+        CASE 
+            WHEN so.client_delivery_date + INTERVAL '7 days' > NOW() 
+                OR so.client_delivery_date + INTERVAL '7 days' > client_del_ts
+                OR so.client_delivery_date + INTERVAL '7 days' > ship.warehouse_delivered_date
+                OR so.client_delivery_date + INTERVAL '7 days' > so.warehouse_delivered_ts 
+                OR so.client_delivery_date + INTERVAL '7 days' > so.delivered_ts 
+                OR (so.client_delivery_date + INTERVAL '7 days' > so.update_ts AND so.system_status IN ('DELIVERED', 'WAREHOUSE_DELIVERED'))
+                THEN 'Вовремя'
+            ELSE 
+                CASE 
+                    WHEN so.system_status IN ('DELIVERED', 'WAREHOUSE_DELIVERED') THEN 'Опоздало, приехало'
+                    ELSE 'Опоздало, в пути'
+                END
+        END
+    ELSE -- Для всех остальных client_id
+        CASE 
+            WHEN so.client_delivery_date > NOW() 
+                OR so.client_delivery_date > client_del_ts
+                OR so.client_delivery_date > ship.warehouse_delivered_date
+                OR so.client_delivery_date > so.warehouse_delivered_ts 
+                OR so.client_delivery_date > so.delivered_ts 
+                OR (so.client_delivery_date > so.update_ts AND so.system_status IN ('DELIVERED', 'WAREHOUSE_DELIVERED'))
+                THEN 'Вовремя'
+            ELSE 
+                CASE 
+                    WHEN so.system_status IN ('DELIVERED', 'WAREHOUSE_DELIVERED') THEN 'Опоздало, приехало'
+                    ELSE 'Опоздало, в пути'
+                END
+        END
+END AS "Факт опоздания"
+    FROM order_service.Supplier_Order so
+LEFT JOIN order_service.Order_item oi ON so.id = oi.supplier_order_id
+LEFT JOIN order_service.Order o ON so.order_id = o.id
+LEFT JOIN fully_delivered fd ON so.id = fd.id
+LEFT JOIN fd_client ON so.id = fd_client.id
+LEFT JOIN (
+    SELECT 
+        so.id, 
+        CASE 
+            WHEN COUNT(CASE WHEN s.warehouse_delivered_date IS NULL THEN 1 END) = 0 
+            THEN MAX(s.warehouse_delivered_date) 
+            ELSE NULL 
+        END AS warehouse_delivered_date
+    FROM order_service.Supplier_Order so
+    LEFT JOIN order_service.cargo_unit cu ON so.id = cu.supplier_order_id
+    LEFT JOIN order_service.cargo_unit_shipment cus ON cu.id = cus.cargo_unit_id
+    LEFT JOIN order_service.shipment s ON cus.shipment_id = s.id
+    GROUP BY so.id
+) AS ship ON so.id = ship.id
+        
+    WHERE
+        so.system_status not in ('DRAFT', 'DECLINED', 'CANCELED') 
+        and so.create_ts > '11.01.2023'
+        and so.is_available_basis IN ('true', 'false')
+    GROUP BY 1,2,3
+),
+
+who as (
+    SELECT 
+        so.id,
+        be.legal_entity, 
+        be.client_id,
+        coalesce(tg.timegate, '0 days') + client_delivery_date as plan_delivery_date, --warehouse_delivered_ts
+        fd."Факт опоздания",
+        CASE
+            WHEN fd."Факт опоздания" = 'Вовремя' THEN 'Никто'
+            WHEN so.is_available_basis = 'true' THEN 'Поставщик'
+            WHEN tg.timegate IS NULL THEN 'РЦ'
+            WHEN nfd.id IS NOT NULL AND now() > date_delivery THEN 'Задержка приемки РЦ'
+            WHEN fdd.rc_delivered_ts < date_delivery AND so.rc_accepted_ts > date_delivery THEN 'Задержка приемки РЦ'
+            WHEN 
+                (o.client_id::int != 2 AND (so.system_status NOT IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date > NOW()))
+                
+                OR (o.client_id::int != 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date > fd_client.client_del_ts))
+                
+                --OR (o.client_id::int != 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date > fdd.rc_delivered_ts))
+                OR (o.client_id::int != 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date > warehouse_delivered_ts))
+                OR (o.client_id::int != 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date > delivered_ts))
+                OR (o.client_id::int != 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date > so.update_ts))
+                OR (o.client_id::int = 2 AND (so.system_status NOT IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date + INTERVAL '7 days' > NOW()))
+                
+                OR (o.client_id::int = 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date + INTERVAL '7 days' > fd_client.client_del_ts))
+                
+                --OR (o.client_id::int = 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date + INTERVAL '7 days' > fdd.rc_delivered_ts))
+                OR (o.client_id::int = 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date + INTERVAL '7 days' > warehouse_delivered_ts))
+                OR (o.client_id::int = 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date + INTERVAL '7 days' > delivered_ts))
+                OR (o.client_id::int = 2 AND (so.system_status IN ('WAREHOUSE_DELIVERED', 'DELIVERED') AND tg.timegate + client_delivery_date + INTERVAL '7 days' > so.update_ts))
+        THEN 'Поставщик'
+        ELSE 'Поставщик + РЦ'
+    END AS who 
+        
+    FROM order_service.Supplier_Order so
+        LEFT JOIN order_service.Order o ON so.order_id = o.id
+        LEFT JOIN client_service.basis b ON b.id = o.basis_id
+        LEFT JOIN client_service.business_entity be ON be.id = b.be_id
+        LEFT JOIN client_service.client cl ON cl.id = o.client_id
+        LEFT JOIN timegate tg ON so.id = tg.id
+        LEFT JOIN full_delivery fd ON so.id = fd.id
+        LEFT JOIN not_fully_delivered nfd ON so.id = nfd.id
+        LEFT JOIN fully_delivered fdd ON so.id = fdd.id
+        LEFT JOIN nfd_client ON so.id = nfd_client.id
+        LEFT JOIN fd_client ON so.id = fd_client.id
+    WHERE
+        so.system_status not in ('DRAFT', 'DECLINED', 'CANCELED') 
+        and so.create_ts > '11.01.2023'
+        and so.is_available_basis IN ('false', 'true')
+),
+
+fact AS ( -- GMV + МОДЕЛИ, которые по факту доставили КЛИЕНТУ
+    SELECT distinct 
+        be.legal_entity, 
+        be.client_id, 
+        DATE_TRUNC('month', so.client_delivery_date) AS month, 
+        "Факт опоздания",
+        who.who,
+        sum(oi.quantity * (oi.unit_price + oi.unit_delivery_price))::float gmv_fact, 
+        count(oi.model_id) as model_count_fact
+    FROM order_service.Order_item oi
+        LEFT JOIN order_service.Supplier_Order so ON oi.supplier_order_id = so.id
+        LEFT JOIN who ON so.id = who.id
+        LEFT JOIN order_service.Order o ON so.order_id = o.id
+        LEFT JOIN client_service.basis b ON b.id = o.basis_id
+        LEFT JOIN client_service.business_entity be ON be.id = b.be_id
+        LEFT JOIN client_service.client cl ON cl.id = o.client_id
+    WHERE 
+        so.system_status not in ('DRAFT', 'DECLINED', 'CANCELED') 
+        and so.create_ts > '11.01.2023'
+        and so.client_delivery_date < now()
+    GROUP BY 1,2,3,4,5
+)
+
+SELECT fact.*, c.name as client_name,
+    CASE
+        WHEN legal_entity = 'АО "БМЗ"' THEN 'ЕХ'
+        WHEN legal_entity = 'АО "Ковдорский ГОК"' THEN 'ЕХ'
+        WHEN legal_entity = 'АО "НАК "Азот"' THEN 'ЕХ'
+        WHEN legal_entity = 'АО "Невинномысский Азот"' THEN 'ЕХ'
+        WHEN legal_entity = 'ООО "ЕвроХим-БМУ"' THEN 'ЕХ'
+        WHEN legal_entity = 'ООО "СИБ - ДАМЕЛЬ"' THEN 'СУЭК'
+        WHEN legal_entity = 'АО "СУЭК-Красноярск"' THEN 'СУЭК'
+        WHEN legal_entity = 'АО "СУЭК-Кузбасс"' THEN 'СУЭК'
+        WHEN legal_entity = 'АО "УПиР"' THEN 'СУЭК'
+        WHEN legal_entity = 'ООО "ЕСК-СУЭК"' THEN 'СУЭК'
+        WHEN legal_entity = 'ООО "ЕвроХим - УКК"' THEN 'ЕХ'
+        WHEN legal_entity = 'ООО "ЕвроХим-ВолгаКалий"' THEN 'ЕХ'
+        WHEN legal_entity = 'ООО "НевРСС"' THEN 'ЕХ'
+        WHEN legal_entity = 'ООО "Новомосковский хлор"' THEN 'ЕХ'
+        ELSE NULL
+    END AS EXorCYEK
+FROM fact
+LEFT JOIN client_service.client c ON client_id = c.id
+WHERE month > '11.01.2023'
