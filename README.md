@@ -68,12 +68,12 @@ Having **two views built from the same logic** ensures **data consistency** and 
 
 ## 🖥️ Sample Output
 
-## Code#1.1 - 1.2
+## Code#1.1 - 1.2 - Business requirement - demonstration of a full dynamics
 
 ![image](https://github.com/user-attachments/assets/e4728636-7bd3-4096-9037-9df0b80a0fdc)
 
 
-## Code#2
+## Code#2.1 - 2.2 - Business requirement - demonstration of a full map
 
 ![image](https://github.com/user-attachments/assets/c2fea9e2-a77a-4683-8eef-c5763aaf97bb)
 
